@@ -154,6 +154,13 @@ class _KeeperRegistry:
         """
         key = str(Path(db_path).resolve(strict=False))
         with self._lock:
+            # Refcount discipline: when other engines in this process still
+            # hold the database open, closing the shared keeper here would
+            # re-create the episode-8/18:42 last-close window (transient
+            # engine teardown under a live sibling engine). Only close when
+            # the last registration is gone (single-engine reset semantics).
+            if self._refs.get(key, 0) > 0:
+                return
             conn = self._keepers.pop(key, None)
             self._refs.pop(key, None)
         if conn is not None:
