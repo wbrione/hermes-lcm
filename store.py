@@ -15,6 +15,7 @@ import math
 import os
 import sqlite3
 import stat
+import atexit
 import threading
 import time
 from datetime import datetime, timezone
@@ -81,6 +82,103 @@ _SIDECAR_SUFFIXES = ("-wal", "-shm")
 _SIDECAR_INLINE_CHECK_INTERVAL_SECONDS = 1.0
 _SIDECAR_HEALTH_LOCK = threading.RLock()
 _SIDECAR_HEALTH_FAILURES: dict[str, str] = {}
+
+
+class _KeeperRegistry:
+    """Process-global keeper-connection registry (episode-8 fix, issue #628).
+
+    Upstream PR #630 pinned the WAL with a keeper connection held by each
+    MessageStore instance. That closes the cross-process last-close window but
+    NOT the intra-process one: code paths that create and destroy store
+    instances while auxiliary raw sqlite connections (trajectory, lifecycle,
+    embedding-read) keep the database open can still hit
+    "last MessageStore shutdown -> last keeper closes -> SQLite unlinks
+    -wal under open raw connections" (episode 8, ops profile, 2026-10-02).
+
+    This registry holds exactly one keeper connection per database path for
+    the whole process lifetime, shared by every MessageStore on that path.
+    Individual store shutdown() never releases it; it is never closed while
+    any store or raw connection might still be open. It dies only with the
+    process (atexit).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._keepers: dict[str, sqlite3.Connection] = {}
+        self._refs: dict[str, int] = {}
+
+    def acquire(self, db_path, opener):
+        """Register a store for db_path; open the shared keeper lazily.
+
+        ``opener`` is a zero-arg callable returning a configured connection
+        (or raising). Called at most once per db_path while refs > 0.
+        """
+        key = str(Path(db_path).resolve(strict=False))
+        with self._lock:
+            self._refs[key] = self._refs.get(key, 0) + 1
+            if key in self._keepers:
+                return self._keepers[key]
+            conn = opener()
+            self._keepers[key] = conn
+            return conn
+
+    def release(self, db_path) -> None:
+        """Drop one registration. The keeper itself is intentionally kept:
+        releasing it on instance shutdown is exactly the episode-8 bug. It is
+        closed only by process exit (atexit) or explicit emergency purge."""
+        key = str(Path(db_path).resolve(strict=False))
+        with self._lock:
+            refs = self._refs.get(key, 0)
+            if refs <= 0:
+                return
+            self._refs[key] = refs - 1
+
+    def refcount(self, db_path) -> int:
+        key = str(Path(db_path).resolve(strict=False))
+        with self._lock:
+            return self._refs.get(key, 0)
+
+    def connection(self, db_path):
+        key = str(Path(db_path).resolve(strict=False))
+        with self._lock:
+            return self._keepers.get(key)
+
+    def purge(self, db_path) -> None:
+        """Close and forget the shared keeper for db_path.
+
+        Only for full engine reset semantics (engine shutdown / profile
+        rebind), where the caller owns the database lifecycle and expects all
+        process fds for the path to be closed (upstream
+        test_reset_closes_sentinel). Instance-level store.shutdown() must NOT
+        use this — that is the episode-8 bug.
+        """
+        key = str(Path(db_path).resolve(strict=False))
+        with self._lock:
+            conn = self._keepers.pop(key, None)
+            self._refs.pop(key, None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _close_all(self) -> None:  # atexit
+        with self._lock:
+            for conn in self._keepers.values():
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._keepers.clear()
+            self._refs.clear()
+
+
+_KEEPER_REGISTRY = _KeeperRegistry()
+atexit.register(_KEEPER_REGISTRY._close_all)
+
+
+def get_keeper_registry():
+    return _KEEPER_REGISTRY
 
 
 def _sidecar_health_key(db_path: Path) -> str:
@@ -535,21 +633,26 @@ class MessageStore:
     def _ensure_keeper_connection(self) -> None:
         if self._is_memory_database or self._keeper_conn is not None:
             return
-        conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
-        try:
-            detail = self._db_identity_changed_detail()
-            if detail is not None:
-                message = self._mark_sidecar_health_failed(detail)
-                primary = self._conn
-                self._conn = None
-                if primary is not None:
-                    primary.close()
-                raise RuntimeError(message)
-            refuse_schema_version_too_new(conn)
-            configure_connection(conn)
-        except Exception:
-            conn.close()
-            raise
+
+        def _open_keeper():
+            conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+            try:
+                detail = self._db_identity_changed_detail()
+                if detail is not None:
+                    message = self._mark_sidecar_health_failed(detail)
+                    primary = self._conn
+                    self._conn = None
+                    if primary is not None:
+                        primary.close()
+                    raise RuntimeError(message)
+                refuse_schema_version_too_new(conn)
+                configure_connection(conn)
+            except Exception:
+                conn.close()
+                raise
+            return conn
+
+        conn = _KEEPER_REGISTRY.acquire(self.db_path, _open_keeper)
         self._keeper_conn = conn
         self._sentinel_conn = conn
 
@@ -2054,13 +2157,14 @@ class MessageStore:
 
     def shutdown(self) -> None:
         self.close()
-        keeper = getattr(self, "_keeper_conn", None) or getattr(self, "_sentinel_conn", None)
-        if keeper:
-            try:
-                keeper.close()
-            finally:
-                self._keeper_conn = None
-                self._sentinel_conn = None
+        if not self._is_memory_database:
+            _KEEPER_REGISTRY.release(self.db_path)
+        # The shared process-global keeper is deliberately NOT closed here:
+        # closing it when one instance shuts down while sibling instances or
+        # auxiliary raw connections are still open is exactly the episode-8
+        # last-close bug (issue #628). It stays pinned for the process lifetime.
+        self._keeper_conn = None
+        self._sentinel_conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

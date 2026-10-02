@@ -1043,6 +1043,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     close()
                 except Exception:
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+        # Full engine storage teardown (reset/rebind semantics): also close
+        # the process-global keeper for this database path so that reset
+        # paths observe every fd closed (upstream test_reset_closes_sentinel).
+        # Instance-level store shutdown() never does this — that is the
+        # episode-8 last-close bug (issue #628).
+        store = state.get("_store")
+        if store is not None and not getattr(store, "_is_memory_database", False):
+            try:
+                from .store import get_keeper_registry
+                get_keeper_registry().purge(str(getattr(store, "db_path", "")))
+            except Exception:
+                logger.debug("LCM failed purging keeper registry during profile rebind", exc_info=True)
         state["_storage_bound"] = False
         state["_storage_binding"] = False
 
