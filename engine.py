@@ -143,6 +143,7 @@ from .sqlite_util import (
 from .store import (
     MessageStore,
     add_contour_failure_listener,
+    clear_sidecar_health_failure,
     load_sidecar_health_failure,
     remove_contour_failure_listener,
 )
@@ -432,14 +433,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             state = object.__getattribute__(self, "__dict__")
             unavailable_reason = state.get("_storage_unavailable_reason", "")
             if unavailable_reason:
-                # Fuse tripped (contour-failure listener or guard tick). Tear
-                # down ALL helpers unconditionally — _close_storage is
-                # idempotent and cheap once torn down. _storage_shutdown (set
-                # by the listener/tick) routes MessageStore through shutdown()
-                # so the orphaned contour's keeper is released too.
-                state["_storage_shutdown"] = True
-                self._close_storage()
-                raise RuntimeError(unavailable_reason)
+                # Fuse tripped (contour-failure listener or guard tick).
+                # Episode-9 (issue #628): try in-process self-recovery first —
+                # teardown + integrity revalidation + rebind on the current
+                # sidecar inode. Raises only when recovery is impossible
+                # (corruption) or inside the cooldown window.
+                if object.__getattribute__(self, "_recover_storage")():
+                    pass  # storage usable again; fall through to the access
+                else:
+                    state["_storage_shutdown"] = True
+                    self._close_storage()
+                    raise RuntimeError(unavailable_reason)
             if (
                 "_storage_lock" in state
                 and not state.get("_storage_bound", False)
@@ -953,7 +957,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 except RuntimeError as exc:
                     state["_storage_unavailable_reason"] = str(exc)
                     state["_storage_shutdown"] = True
-                    self._close_storage()
+                    # Episode-9 (issue #628): the tick path may recover
+                    # in-process instead of leaving the path unguarded
+                    # until an operator restart. Cooldown inside
+                    # _recover_storage prevents hot-looping.
+                    self._recover_storage()
                     return
                 except Exception:
                     logger.exception("LCM sidecar guard failed unexpectedly")
@@ -964,15 +972,100 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ):
                 self._schedule_sidecar_guard()
 
+    _FUSE_RECOVERY_MIN_INTERVAL_SECONDS = 60.0
+
+    def _recover_storage(self) -> bool:
+        """Self-recovery after a sidecar contour fuse (episode-9, issue #628).
+
+        Upstream fuse semantics: latch + raise until the OPERATOR restarts the
+        process. That leaves the database path unguarded for the whole
+        unsupervised window (any last-close in any process re-creates the
+        episode-8/8b/9 unlink-under-holders), and in a CLI/gateway split process
+        fleet the "restart" advice has repeatedly failed to stop recurrence.
+
+        Recovery here is safe BECAUSE the fuse path already guarantees the
+        dangerous state is gone: every connection of this process was closed
+        during teardown. What remains is (a) validate the database on disk,
+        (b) clear the latch, (c) rebind fresh connections on the CURRENT
+        sidecar inode — identical to what a fresh process would do at startup.
+        Returns True when storage is usable again.
+        """
+        state = object.__getattribute__(self, "__dict__")
+        lock = state.get("_storage_lock")
+        if lock is None:
+            lock = threading.RLock()
+            state["_storage_lock"] = lock
+        with lock:
+            import time as _time
+
+            db_path = state.get("_storage_db_path")
+            if db_path is None:
+                return False
+            last = state.get("_last_fuse_recovery_at", 0.0)
+            now = _time.time()
+            if now - last < self._FUSE_RECOVERY_MIN_INTERVAL_SECONDS:
+                return False
+            # 1) teardown everything this process still holds for the path
+            try:
+                self._close_storage()
+            except Exception:
+                logger.debug("fuse-recovery: teardown failed", exc_info=True)
+            # 2) the database on disk must be intact — recovery never
+            #    rebinds against corruption (that stays an operator repair).
+            #    Fresh quick_check, NOT the startup cache.
+            ok = False
+            detail = ""
+            conn = None
+            try:
+                conn = sqlite3.connect(self._sqlite_readonly_uri(Path(db_path)), uri=True)
+                rows = conn.execute("PRAGMA quick_check").fetchall()
+                lines = [str(row[0]) for row in rows if row and row[0] is not None]
+                ok = bool(lines) and lines == ["ok"]
+                detail = "\n".join(lines[:3])
+            except Exception as exc:
+                detail = str(exc) or exc.__class__.__name__
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            if not ok:
+                logger.error(
+                    "fuse-recovery refused: lcm.db failed quick_check: %s", detail
+                )
+                return False
+            # 3) clear the latch and rebind on the current contour
+            clear_sidecar_health_failure(db_path)
+            state["_storage_unavailable_reason"] = ""
+            state["_storage_shutdown"] = False
+            state["_storage_bound"] = False
+            state["_last_fuse_recovery_at"] = now
+            try:
+                self._bind_storage(db_path, state.get("_storage_hermes_home", ""))
+            except Exception:
+                logger.debug("fuse-recovery: rebind failed", exc_info=True)
+                return False
+            logger.warning(
+                "LCM storage self-recovered after sidecar fuse (issue #628): "
+                "all connections rebound to the current sidecar identity"
+            )
+            return True
+
     def _ensure_storage(self) -> None:
         """Bind SQLite helpers on first use of a lazy clone."""
         reason = self._storage_unavailable_reason
         if reason:
-            raise RuntimeError(reason)
+            # Episode-9: fuse latched on this engine — attempt self-recovery
+            # before propagating (issue #628). Falls through when recovery
+            # rebinds cleanly; raises the original reason when it cannot.
+            if not self._recover_storage():
+                raise RuntimeError(reason)
         sidecar_failure = load_sidecar_health_failure(self._storage_db_path)
         if sidecar_failure:
             self._storage_unavailable_reason = sidecar_failure
-            raise RuntimeError(sidecar_failure)
+            if not self._recover_storage():
+                raise RuntimeError(sidecar_failure)
         if self._storage_bound:
             return
         with self._storage_lock:
