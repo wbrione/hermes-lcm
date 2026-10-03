@@ -217,21 +217,6 @@ def load_sidecar_health_failure(db_path: str | Path) -> str:
         return _SIDECAR_HEALTH_FAILURES.get(_sidecar_health_key(Path(db_path)), "")
 
 
-def clear_sidecar_health_failure(db_path: str | Path) -> None:
-    """Clear the process-global fuse flag for db_path.
-
-    Episode-9 fix (issue #628): the fuse is a latched, process-wide "restart
-    required" state — but there is nothing an operator can restart that we
-    cannot recover in-process: teardown already closes every connection of
-    this process, and after that a clean rebind (fresh connections on the
-    current sidecar inode) is equivalent to a fresh process, minus the
-    unsupervised window. Used by the engine's self-recovery path after a
-    full teardown + integrity revalidation.
-    """
-    with _SIDECAR_HEALTH_LOCK:
-        _SIDECAR_HEALTH_FAILURES.pop(_sidecar_health_key(Path(db_path)), None)
-
-
 _CONTOUR_FAILURE_LISTENERS: dict[int, Callable[[str], None]] = {}
 
 
