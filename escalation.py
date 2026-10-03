@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import re
 import threading
 import time
@@ -227,6 +228,24 @@ def _sanitize_reasoning_summary(text: str) -> str:
     return stripped
 
 
+def _summary_reasoning_config() -> Optional[dict]:
+    """Build reasoning_config for summary calls from LCM_SUMMARY_REASONING_EFFORT.
+
+    Empty/unset = None (send nothing; the route default applies — upstream
+    behavior). "none" requests reasoning off; any other accepted value
+    ("low", "minimal", "medium", "high") is passed through as the effort.
+    The Hermes auxiliary client already owns the refusal ladder (mandatory-
+    reasoning routes get floored to "low"; field-rejecting routes retry
+    without it), so pass-through here stays safe on every route shape.
+    """
+    effort = (os.environ.get("LCM_SUMMARY_REASONING_EFFORT", "") or "").strip().lower()
+    if not effort:
+        return None
+    if effort == "none":
+        return {"enabled": False}
+    return {"enabled": True, "effort": effort}
+
+
 def _call_llm_for_summary(prompt: str | list[dict[str, str]], max_tokens: int,
                            model: str = "", timeout: float | None = None) -> Optional[str]:
     """Call the Hermes auxiliary LLM for summarization."""
@@ -254,6 +273,9 @@ def _call_llm_for_summary(prompt: str | list[dict[str, str]], max_tokens: int,
             "temperature": 0.3,
             "max_tokens": max_tokens,
         }
+        reasoning_config = _summary_reasoning_config()
+        if reasoning_config is not None:
+            call_kwargs["reasoning_config"] = reasoning_config
         apply_lcm_model_route(call_kwargs, model)
         if timeout is not None:
             call_kwargs["timeout"] = timeout

@@ -359,6 +359,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("large_output_active_replay_stub_threshold_tokens", "LCM_LARGE_OUTPUT_ACTIVE_REPLAY_STUB_THRESHOLD_TOKENS", int),
     _EnvFieldSpec("large_output_transcript_gc_enabled", "LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED", bool),
     _EnvFieldSpec("summary_model", "LCM_SUMMARY_MODEL", str),
+    _EnvFieldSpec("summary_reasoning_effort", "LCM_SUMMARY_REASONING_EFFORT", str),
     _EnvFieldSpec("summary_circuit_breaker_failure_threshold", "LCM_SUMMARY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", int),
     _EnvFieldSpec("summary_circuit_breaker_cooldown_seconds", "LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS", int),
     _EnvFieldSpec("summary_spend_max_calls", "LCM_SUMMARY_SPEND_MAX_CALLS", int),
@@ -579,6 +580,12 @@ class LCMConfig:
 
     # -- Models ---
     summary_model: str = ""       # empty = use Hermes auxiliary model
+    # Reasoning effort for summary calls (issue #628 ops deployment): summaries
+    # are pure condensation of in-prompt evidence, so high reasoning only adds
+    # latency. Accepted values follow the Hermes auxiliary reasoning_config:
+    # "low", "minimal", "medium", "high", or "none" to request reasoning off.
+    # Empty = do not send any reasoning field (route default, upstream behavior).
+    summary_reasoning_effort: str = ""
     # Optional fallback summary models tried after summary_model/task default.
     summary_fallback_models: list[str] = field(default_factory=list)
     # Consecutive failed summary calls before a route is skipped temporarily.
